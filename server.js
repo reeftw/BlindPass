@@ -1,8 +1,51 @@
 import express from 'express';
+import { randomBytes } from 'node:crypto';
+import QRCode from 'qrcode';
 
 const app = express();
-const PORT = 3000;
-const ORIGIN = `http://localhost:${PORT}`;
+const PORT = Number(process.env.PORT) || 3000;
+const DEFAULT_ORIGIN = `http://localhost:${PORT}`;
+const configuredOrigin = new URL(
+    process.env.APP_ORIGIN || process.env.RENDER_EXTERNAL_URL || DEFAULT_ORIGIN
+);
+const isLocalHttpOrigin =
+    configuredOrigin.protocol === 'http:' &&
+    ['localhost', '127.0.0.1', '[::1]'].includes(configuredOrigin.hostname);
+
+if (
+    (configuredOrigin.protocol !== 'https:' && !isLocalHttpOrigin) ||
+    configuredOrigin.pathname !== '/' ||
+    configuredOrigin.search ||
+    configuredOrigin.hash ||
+    configuredOrigin.username ||
+    configuredOrigin.password
+) {
+    throw new Error('APP_ORIGIN must be an HTTPS origin (HTTP is allowed only for localhost development)');
+}
+
+const ORIGIN = configuredOrigin.origin;
+const SESSION_LIFETIME_MS = 20 * 60 * 1000;
+const allowedReturnOrigins = new Set([ORIGIN]);
+
+for (const value of (process.env.ALLOWED_RETURN_ORIGINS || '').split(',')) {
+    const origin = value.trim();
+    if (!origin) continue;
+    const parsedOrigin = new URL(origin);
+    const isLocalHttp =
+        parsedOrigin.protocol === 'http:' &&
+        ['localhost', '127.0.0.1', '[::1]'].includes(parsedOrigin.hostname);
+    if (
+        (parsedOrigin.protocol !== 'https:' && !isLocalHttp) ||
+        parsedOrigin.pathname !== '/' ||
+        parsedOrigin.search ||
+        parsedOrigin.hash ||
+        parsedOrigin.username ||
+        parsedOrigin.password
+    ) {
+        throw new Error('ALLOWED_RETURN_ORIGINS must contain HTTPS origins (HTTP is allowed only for localhost development)');
+    }
+    allowedReturnOrigins.add(parsedOrigin.origin);
+}
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
@@ -11,9 +54,28 @@ const MICROSOFT_CLIENT_SECRET = process.env.MICROSOFT_CLIENT_SECRET || '';
 const MICROSOFT_TENANT_ID = process.env.MICROSOFT_TENANT_ID || 'common';
 
 const sessions = new Map();
+app.use(express.json({ limit: '16kb' }));
+
+const sessionCleanup = setInterval(() => {
+    const now = Date.now();
+    for (const [sessionId, session] of sessions) {
+        if (session.expiresAt <= now) sessions.delete(sessionId);
+    }
+}, 60_000);
+sessionCleanup.unref();
+
+function getSession(sessionId) {
+    const session = sessions.get(sessionId);
+    if (!session) return null;
+    if (session.expiresAt <= Date.now()) {
+        sessions.delete(sessionId);
+        return null;
+    }
+    return session;
+}
 
 function createSession(verifier = 'Discord', returnTo = `${ORIGIN}/verifier.html`) {
-    const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionId = randomBytes(32).toString('base64url');
     const session = {
         sessionId,
         verifier,
@@ -21,6 +83,9 @@ function createSession(verifier = 'Discord', returnTo = `${ORIGIN}/verifier.html
         loggedIn: false,
         provider: null,
         email: null,
+        verified: false,
+        isOver18: null,
+        expiresAt: Date.now() + SESSION_LIFETIME_MS,
     };
     sessions.set(sessionId, session);
     return session;
@@ -34,7 +99,7 @@ function safeReturnUrl(rawUrl) {
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
             return fallback;
         }
-        if (parsed.origin !== ORIGIN) {
+        if (!allowedReturnOrigins.has(parsed.origin)) {
             return fallback;
         }
         if (parsed.pathname === '/start' || parsed.pathname.startsWith('/auth/')) {
@@ -138,11 +203,76 @@ app.get('/start', (req, res) => {
 });
 
 app.get('/api/session/:sessionId', (req, res) => {
-    const session = sessions.get(req.params.sessionId);
+    const session = getSession(req.params.sessionId);
     if (!session) {
         return res.status(404).json({ error: 'Session not found' });
     }
-    res.json(session);
+    res.set('Cache-Control', 'no-store');
+    res.json({
+        sessionId: session.sessionId,
+        verifier: session.verifier,
+        returnTo: session.returnTo,
+        loggedIn: session.loggedIn,
+        provider: session.provider,
+        email: session.email,
+        verified: session.verified,
+        isOver18: session.isOver18,
+        expiresAt: session.expiresAt,
+        appOrigin: ORIGIN,
+        phoneReady: configuredOrigin.protocol === 'https:',
+    });
+});
+
+app.get('/api/session/:sessionId/qr', async (req, res) => {
+    const session = getSession(req.params.sessionId);
+    if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+    }
+    if (!session.loggedIn || session.verified) {
+        return res.status(409).json({ error: 'This session is not waiting for phone verification' });
+    }
+    if (configuredOrigin.protocol !== 'https:') {
+        return res.status(503).json({ error: 'Phone verification requires HTTPS. Configure APP_ORIGIN with your HTTPS site URL.' });
+    }
+
+    const phoneUrl = new URL('/', ORIGIN);
+    phoneUrl.searchParams.set('session', session.sessionId);
+    phoneUrl.searchParams.set('mode', 'phone');
+    const svg = await QRCode.toString(phoneUrl.toString(), {
+        type: 'svg',
+        errorCorrectionLevel: 'Q',
+        margin: 2,
+        width: 256,
+    });
+
+    res.set('Cache-Control', 'no-store');
+    res.type('svg').send(svg);
+});
+
+app.post('/api/session/:sessionId/verify', (req, res) => {
+    const requestOrigin = req.get('origin');
+    if (requestOrigin && requestOrigin !== ORIGIN) {
+        return res.status(403).json({ error: 'Verification must come from the configured app origin' });
+    }
+
+    const session = getSession(req.params.sessionId);
+    if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+    }
+    if (!session.loggedIn) {
+        return res.status(403).json({ error: 'Sign in on the requesting device before verifying' });
+    }
+    if (session.verified) {
+        return res.status(409).json({ error: 'This session has already been verified' });
+    }
+    if (typeof req.body?.isOver18 !== 'boolean') {
+        return res.status(400).json({ error: 'isOver18 must be a boolean' });
+    }
+
+    session.verified = true;
+    session.isOver18 = req.body.isOver18;
+    session.verifiedAt = Date.now();
+    res.status(201).json({ verified: true });
 });
 
 app.get('/auth/callback', async (req, res) => {
@@ -154,11 +284,9 @@ app.get('/auth/callback', async (req, res) => {
         const parsed = JSON.parse(Buffer.from(String(req.query.state || ''), 'base64url').toString('utf8'));
         const provider = parsed.provider === 'microsoft' ? 'microsoft' : 'google';
 
-        let session = sessions.get(parsed.sessionId);
+        const session = getSession(parsed.sessionId);
         if (!session) {
-            session = createSession('Discord', `${ORIGIN}/verifier.html`);
-            sessions.set(parsed.sessionId, session);
-            session.sessionId = parsed.sessionId;
+            return res.status(410).send('This sign-in session has expired. Return to the requesting site and start again.');
         }
 
         const redirectUri = `${ORIGIN}/auth/callback`;
@@ -204,7 +332,10 @@ app.get('/auth/:provider', (req, res) => {
     const provider = req.params.provider === 'microsoft' ? 'microsoft' : 'google';
     const rawSessionId = String(req.query.session || '');
 
-    let session = sessions.get(rawSessionId);
+    let session = getSession(rawSessionId);
+    if (rawSessionId && !session) {
+        return res.status(404).send('Verification session not found or expired. Start again from the requesting site.');
+    }
     if (!session) {
         session = createSession('Discord', `${ORIGIN}/verifier.html`);
     }
