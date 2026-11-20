@@ -83,7 +83,7 @@
         <h1>Discord Server Age Verification</h1>
         <p>Prove you are 18+ using BlindPass. Scan the QR code with your phone to verify without sharing your ID image.</p>
 
-        <a class="btn" href="/start?verifier=Discord&return_to=%2Fverifier.html">
+        <a id="blindPassLink" class="btn" href="/start?verifier=Discord&return_url=%2Fverifier.html">
             Verify using BlindPass
         </a>
 
@@ -93,9 +93,15 @@
     <script>
         const params = new URLSearchParams(window.location.search);
         const statusEl = document.getElementById('status');
+        const startUrl = new URL('/start', window.location.origin);
+        startUrl.searchParams.set('verifier', 'Discord');
+        startUrl.searchParams.set('return_url', `${window.location.origin}${window.location.pathname}`);
+        document.getElementById('blindPassLink').href = startUrl.toString();
 
-        if (params.get('verified') === '1') {
-            const isOver18 = params.get('is_over_18') === 'true';
+        if (params.get('cancelled') === 'true') {
+            statusEl.textContent = 'Status: Verification cancelled.';
+        } else if (params.get('verified') === 'true' || params.get('verified') === '1') {
+            const isOver18 = params.get('is_adult') === 'true' || params.get('is_over_18') === 'true';
             statusEl.innerHTML = isOver18
                 ? 'Status: <span class="ok">Verified (18+: true)</span>'
                 : 'Status: <span class="no">Not 18+ (18+: false)</span>';

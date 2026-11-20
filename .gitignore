@@ -154,3 +154,7 @@ vite.config.ts.timestamp-*
 eng.traineddata
 
 sample_id.jpg
+
+# Dataset & archives
+midv2020/
+*.tar

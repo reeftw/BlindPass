@@ -3,11 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check public/app.js"
+    "check": "node --check server.js && node --check server/auth.js && node --check server/accounts.js && node --check server/wallet.js && node --check server/verification.js && node --check server/passkeys.js && node --check server/webauthn-config.js && node --check public/app.js && node --check public/verification-ui.js && node --check public/mrz.js && node --check public/camera-crop.js && node --check public/icao-countries.js",
+    "test": "node --test"
   },
   "dependencies": {
+    "@simplewebauthn/browser": "^14.0.0",
+    "@simplewebauthn/server": "^14.1.0",
     "@supabase/supabase-js": "^2.118.0",
     "express": "^5.3.0",
     "qrcode": "^1.5.4",
