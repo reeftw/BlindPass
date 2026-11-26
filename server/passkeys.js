@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 export const PASSKEY_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const MAX_PASSKEY_CHALLENGES = 10_000;
 
 const USER_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -36,6 +37,10 @@ export function issuePasskeyChallenge(
     },
     now = Date.now()
 ) {
+    clearExpiredPasskeyChallenges(challenges, now);
+    if (challenges.size >= MAX_PASSKEY_CHALLENGES) {
+        throw new Error('Too many active passkey challenges');
+    }
     const flowToken = randomBytes(32).toString('base64url');
     challenges.set(flowToken, {
         challenge,

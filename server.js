@@ -1,5 +1,5 @@
 import express from 'express';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
@@ -40,6 +40,10 @@ import {
     validateWalletApproval,
 } from './server/wallet.js';
 import { resolveWebAuthnConfig } from './server/webauthn-config.js';
+import {
+    createVerifierReturnToken,
+    verifyVerifierReturnToken,
+} from './server/verifier-token.js';
 
 const app = express();
 const ROOT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -53,8 +57,12 @@ const { configuredOrigin, expectedOrigin: ORIGIN, rpID } = resolveWebAuthnConfig
 });
 const SESSION_LIFETIME_MS = 20 * 60 * 1000;
 const OAUTH_STATE_LIFETIME_MS = 10 * 60 * 1000;
+const MAX_ACTIVE_SESSIONS = 10_000;
+const MAX_OAUTH_STATES = 1_000;
+const MAX_VERIFIER_RETURN_NONCES = 10_000;
 const PASSKEY_CHALLENGES = new Map();
 const OAUTH_STATES = new Map();
+const VERIFIER_RETURN_NONCES = new Map();
 const allowedReturnOrigins = new Set([ORIGIN]);
 
 for (const value of (process.env.ALLOWED_RETURN_ORIGINS || '').split(',')) {
@@ -93,9 +101,37 @@ if (!SESSION_SECRET) {
 if (SESSION_SECRET.length < 32) {
     throw new Error('SESSION_SECRET must be at least 32 characters');
 }
+const OAUTH_SUBJECT_PEPPER = process.env.OAUTH_SUBJECT_PEPPER || SESSION_SECRET;
+if (OAUTH_SUBJECT_PEPPER.length < 32) {
+    throw new Error('OAUTH_SUBJECT_PEPPER must be at least 32 characters');
+}
 
 const sessions = new Map();
 let supabaseAdmin = null;
+app.use((req, res, next) => {
+    res.set({
+        'Content-Security-Policy': [
+            "default-src 'self'",
+            "base-uri 'self'",
+            "object-src 'none'",
+            "frame-ancestors 'none'",
+            "form-action 'self' https://accounts.google.com https://login.microsoftonline.com",
+            "script-src 'self' 'wasm-unsafe-eval'",
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+            "font-src 'self' https://fonts.gstatic.com data:",
+            "img-src 'self' data: blob:",
+            "media-src 'self' blob:",
+            "worker-src 'self' blob:",
+            "connect-src 'self' https://cdn.jsdelivr.net",
+        ].join('; '),
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Permissions-Policy': 'camera=(self), publickey-credentials-get=(self), publickey-credentials-create=(self)',
+    });
+    if (req.path === '/verifier.html') res.set('Cache-Control', 'no-store');
+    next();
+});
 app.use(express.json({ limit: '64kb' }));
 
 const sessionCleanup = setInterval(() => {
@@ -106,6 +142,9 @@ const sessionCleanup = setInterval(() => {
     clearExpiredPasskeyChallenges(PASSKEY_CHALLENGES, now);
     for (const [state, record] of OAUTH_STATES) {
         if (record.expiresAt <= now) OAUTH_STATES.delete(state);
+    }
+    for (const [nonce, record] of VERIFIER_RETURN_NONCES) {
+        if (record.expiresAt <= now) VERIFIER_RETURN_NONCES.delete(nonce);
     }
 }, 60_000);
 sessionCleanup.unref();
@@ -120,12 +159,20 @@ function getSession(sessionId) {
     return session;
 }
 
-function createSession(verifier = 'Verifier', returnTo = null) {
+function createSession(verifier = 'Verifier', returnTo = null, verifierState) {
+    const now = Date.now();
+    for (const [sessionId, session] of sessions) {
+        if (session.expiresAt <= now) sessions.delete(sessionId);
+    }
+    if (sessions.size >= MAX_ACTIVE_SESSIONS) {
+        throw new Error('Too many active verification sessions');
+    }
     const sessionId = randomBytes(32).toString('base64url');
     const session = {
         sessionId,
         verifier,
         returnTo,
+        verifierState,
         loggedIn: false,
         provider: null,
         userId: null,
@@ -137,7 +184,10 @@ function createSession(verifier = 'Verifier', returnTo = null) {
         cancelled: false,
         verificationTokenUsed: false,
         verificationPending: false,
-        expiresAt: Date.now() + SESSION_LIFETIME_MS,
+        returnTokenIssued: false,
+        returnToken: null,
+        returnTokenNonce: null,
+        expiresAt: now + SESSION_LIFETIME_MS,
     };
     sessions.set(sessionId, session);
     return session;
@@ -268,14 +318,38 @@ async function loadAccountSnapshot(supabase, userId) {
 
 function rejectUnexpectedOrigin(req, res, action) {
     const requestOrigin = req.get('origin');
-    if (requestOrigin && requestOrigin !== ORIGIN) {
+    if (requestOrigin !== ORIGIN) {
         res.status(403).json({ error: `${action} must come from the configured app origin` });
         return true;
     }
     return false;
 }
 
-async function exchangeGoogleCode(code, redirectUri) {
+function isSafeEqual(left, right) {
+    if (typeof left !== 'string' || typeof right !== 'string') return false;
+    const leftBuffer = Buffer.from(left);
+    const rightBuffer = Buffer.from(right);
+    return leftBuffer.length === rightBuffer.length &&
+        timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function getCookieValue(cookieHeader, name) {
+    if (typeof cookieHeader !== 'string') return '';
+    const cookie = cookieHeader.split(';')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith(`${name}=`));
+    return cookie ? cookie.slice(name.length + 1) : '';
+}
+
+function serializeOAuthStateCookie(state, secure) {
+    return `blindpass_oauth_state=${state}; Path=/auth/callback; Max-Age=${OAUTH_STATE_LIFETIME_MS / 1000}; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`;
+}
+
+function clearOAuthStateCookie(secure) {
+    return `blindpass_oauth_state=; Path=/auth/callback; Max-Age=0; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`;
+}
+
+async function exchangeGoogleCode(code, redirectUri, codeVerifier) {
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -285,6 +359,7 @@ async function exchangeGoogleCode(code, redirectUri) {
             client_secret: GOOGLE_CLIENT_SECRET,
             redirect_uri: redirectUri,
             grant_type: 'authorization_code',
+            code_verifier: codeVerifier,
         }),
     });
     const tokenData = await tokenRes.json();
@@ -302,7 +377,7 @@ async function exchangeGoogleCode(code, redirectUri) {
     return userData.sub;
 }
 
-async function exchangeMicrosoftCode(code, redirectUri) {
+async function exchangeMicrosoftCode(code, redirectUri, codeVerifier) {
     const tokenUrl = `https://login.microsoftonline.com/${MICROSOFT_TENANT_ID}/oauth2/v2.0/token`;
     const tokenRes = await fetch(tokenUrl, {
         method: 'POST',
@@ -313,6 +388,7 @@ async function exchangeMicrosoftCode(code, redirectUri) {
             client_secret: MICROSOFT_CLIENT_SECRET,
             redirect_uri: redirectUri,
             grant_type: 'authorization_code',
+            code_verifier: codeVerifier,
         }),
     });
     const tokenData = await tokenRes.json();
@@ -336,7 +412,42 @@ app.use(
         maxAge: '1h',
     })
 );
+app.use(
+    '/vendor/tesseract',
+    express.static(resolve(ROOT_DIR, 'node_modules/tesseract.js/dist'), {
+        maxAge: '1h',
+    })
+);
+app.use(
+    '/vendor/tesseract-core',
+    express.static(resolve(ROOT_DIR, 'node_modules/tesseract.js-core'), {
+        maxAge: '1h',
+        index: false,
+    })
+);
 app.use(express.static(resolve(ROOT_DIR, 'public')));
+
+app.post('/api/verifier/verify-token', (req, res) => {
+    if (rejectUnexpectedOrigin(req, res, 'Verifier result')) return;
+    if (!hasExactFields(req.body, ['token', 'state'])) {
+        return res.status(400).json({ error: 'Invalid verifier result' });
+    }
+
+    const payload = verifyVerifierReturnToken(req.body.token, {
+        secret: SESSION_SECRET,
+        expectedState: req.body.state,
+        pendingNonces: VERIFIER_RETURN_NONCES,
+    });
+    if (!payload) {
+        return res.status(401).json({ error: 'Verifier result is invalid, expired, or already used' });
+    }
+
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+        verified: true,
+        isAdult: payload.is_adult,
+    });
+});
 
 app.get('/api/account', async (req, res) => {
     const userId = getAuthenticatedUserId(req);
@@ -386,16 +497,92 @@ app.post('/api/auth/logout', (req, res) => {
     return res.json({ loggedOut: true });
 });
 
+app.post('/api/wallet/save/options', async (req, res) => {
+    if (rejectUnexpectedOrigin(req, res, 'Wallet update')) return;
+    if (!hasExactFields(req.body, [], ['qrToken'])) {
+        return res.status(400).json({ error: 'Invalid Wallet credential request' });
+    }
+    const context = getUserContext(req, res, req.body);
+    if (!context) return;
+    const supabase = getSupabaseAdmin();
+    if (!supabase) {
+        return res.status(503).json({ error: 'Passkey storage is not configured on the server' });
+    }
+
+    try {
+        const { data: credentials, error } = await supabase
+            .from('passkeys')
+            .select('credential_id, transports')
+            .eq('user_id', context.userId);
+        if (error) throw error;
+        if (!credentials?.length) {
+            return res.status(404).json({
+                code: 'passkey-not-found',
+                error: 'Register a passkey before saving a Wallet credential',
+            });
+        }
+
+        const options = await generateAuthenticationOptions({
+            rpID,
+            timeout: 60_000,
+            userVerification: 'required',
+            allowCredentials: credentials.map((credential) => ({
+                id: credential.credential_id,
+                transports: Array.isArray(credential.transports)
+                    ? credential.transports
+                    : undefined,
+            })),
+        });
+        const flowToken = issuePasskeyChallenge(PASSKEY_CHALLENGES, {
+            challenge: options.challenge,
+            ceremony: 'wallet-save',
+            userId: context.userId,
+            sessionId: context.sessionId,
+            sessionExpiresAt: context.session?.expiresAt,
+        });
+        res.set('Cache-Control', 'no-store');
+        return res.json({ flowToken, options });
+    } catch (error) {
+        console.error(
+            'Could not create Wallet save passkey options:',
+            error instanceof Error ? error.message : 'database error'
+        );
+        return res.status(502).json({ error: 'Could not start Wallet credential confirmation' });
+    }
+});
+
 app.post('/api/wallet/save', async (req, res) => {
     if (rejectUnexpectedOrigin(req, res, 'Wallet update')) return;
     if (!hasExactFields(
         req.body,
-        ['verified', 'isAdult', 'documentType', 'issuingCountry', 'expiresAt'],
+        [
+            'verified',
+            'isAdult',
+            'documentType',
+            'issuingCountry',
+            'expiresAt',
+            'flowToken',
+            'assertion',
+        ],
         ['qrToken']
     )) {
         return res.status(400).json({ error: 'Invalid Wallet credential payload' });
     }
-    const validation = validateWalletSavePayload(req.body, ISSUING_COUNTRY_CODES);
+    if (
+        typeof req.body.flowToken !== 'string' ||
+        !isValidAuthenticationResponse(req.body.assertion)
+    ) {
+        return res.status(400).json({ error: 'Wallet credentials require a passkey assertion' });
+    }
+    const walletPayload = {
+        ...(req.body.qrToken === undefined ? {} : { qrToken: req.body.qrToken }),
+        verified: req.body.verified,
+        isAdult: req.body.isAdult,
+        documentType: req.body.documentType,
+        issuingCountry: req.body.issuingCountry,
+        expiresAt: req.body.expiresAt,
+    };
+    const validation = validateWalletSavePayload(walletPayload, ISSUING_COUNTRY_CODES);
     if (!validation.ok) {
         return res.status(400).json({ error: 'The locally verified ID outcome is invalid or expired' });
     }
@@ -407,6 +594,70 @@ app.post('/api/wallet/save', async (req, res) => {
     }
 
     try {
+        const challenge = consumePasskeyChallenge(
+            PASSKEY_CHALLENGES,
+            req.body.flowToken,
+            {
+                ceremony: 'wallet-save',
+                userId: context.userId,
+                sessionId: context.sessionId,
+            }
+        );
+        if (!challenge) {
+            return res.status(409).json({
+                error: 'Wallet save passkey challenge is missing, expired, or already used',
+            });
+        }
+        const { data: passkey, error: passkeyError } = await supabase
+            .from('passkeys')
+            .select('id, user_id, credential_id, public_key, counter, transports')
+            .eq('user_id', context.userId)
+            .eq('credential_id', req.body.assertion.id)
+            .maybeSingle();
+        if (passkeyError) throw passkeyError;
+        if (!passkey || !Number.isSafeInteger(Number(passkey.counter))) {
+            return res.status(401).json({ error: 'This account passkey was not recognized' });
+        }
+
+        let authentication;
+        try {
+            authentication = await verifyAuthenticationResponse({
+                response: req.body.assertion,
+                expectedChallenge: challenge.challenge,
+                expectedOrigin: ORIGIN,
+                expectedRPID: rpID,
+                credential: {
+                    id: passkey.credential_id,
+                    publicKey: Buffer.from(passkey.public_key, 'base64url'),
+                    counter: Number(passkey.counter),
+                    transports: Array.isArray(passkey.transports)
+                        ? passkey.transports
+                        : undefined,
+                },
+                requireUserVerification: true,
+            });
+        } catch {
+            return res.status(401).json({ error: 'Wallet save passkey assertion could not be verified' });
+        }
+        if (
+            !authentication.verified ||
+            !authentication.authenticationInfo.userVerified ||
+            authentication.authenticationInfo.credentialID !== passkey.credential_id
+        ) {
+            return res.status(401).json({ error: 'Wallet save passkey assertion could not be verified' });
+        }
+        const { data: updatedCredential, error: counterError } = await supabase
+            .from('passkeys')
+            .update({ counter: authentication.authenticationInfo.newCounter })
+            .eq('id', passkey.id)
+            .eq('counter', Number(passkey.counter))
+            .select('id')
+            .maybeSingle();
+        if (counterError) throw counterError;
+        if (!updatedCredential) {
+            return res.status(409).json({ error: 'This passkey was used concurrently. Try again.' });
+        }
+
         const { data, error } = await supabase
             .from('wallet_credentials')
             .upsert(
@@ -441,7 +692,28 @@ app.get('/start', (req, res) => {
         ORIGIN,
         allowedReturnOrigins
     );
-    const session = createSession(verifier, returnTo);
+    const requestedState = req.query.state;
+    if (
+        requestedState !== undefined &&
+        (typeof requestedState !== 'string' ||
+            !/^[A-Za-z0-9_-]{16,128}$/.test(requestedState))
+    ) {
+        return res.status(400).send('Invalid verifier state.');
+    }
+    let session;
+    try {
+        session = createSession(
+            verifier,
+            returnTo,
+            requestedState || randomBytes(24).toString('base64url')
+        );
+    } catch (error) {
+        console.error(
+            'Could not create verification session:',
+            error instanceof Error ? error.message : 'unknown error'
+        );
+        return res.status(503).send('Too many active verification sessions. Try again shortly.');
+    }
     res.set('Cache-Control', 'no-store');
     res.redirect(302, `/?session=${encodeURIComponent(session.sessionId)}`);
 });
@@ -453,15 +725,12 @@ app.get('/api/session/:sessionId', async (req, res) => {
     }
 
     const cookieUserId = getAuthenticatedUserId(req);
-    if (!session.userId && cookieUserId) {
-        session.userId = cookieUserId;
-        session.loggedIn = true;
-    } else if (session.userId && cookieUserId && session.userId !== cookieUserId) {
+    if (session.userId && cookieUserId && session.userId !== cookieUserId) {
         return res.status(403).json({ error: 'This verification session belongs to another account' });
     }
 
     let account = null;
-    if (session.userId) {
+    if (session.userId && cookieUserId === session.userId) {
         const supabase = getSupabaseAdmin();
         if (!supabase) {
             return res.status(503).json({ error: 'BlindPass account storage is not configured' });
@@ -498,6 +767,81 @@ app.get('/api/session/:sessionId', async (req, res) => {
     });
 });
 
+app.post('/api/session/:sessionId/claim', (req, res) => {
+    if (rejectUnexpectedOrigin(req, res, 'Session claim')) return;
+    if (!hasExactFields(req.body, [])) {
+        return res.status(400).json({ error: 'Invalid session claim request' });
+    }
+    const session = getSession(req.params.sessionId);
+    if (!session) {
+        return res.status(404).json({ error: 'Session not found or expired' });
+    }
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Sign in before claiming this session' });
+    if (session.cancelled || session.verified) {
+        return res.status(409).json({ error: 'This verification session is no longer available' });
+    }
+    if (session.userId && session.userId !== userId) {
+        return res.status(403).json({ error: 'This verification session belongs to another account' });
+    }
+
+    session.userId = userId;
+    session.loggedIn = true;
+    res.set('Cache-Control', 'no-store');
+    return res.json({ claimed: true });
+});
+
+app.post('/api/session/:sessionId/return-token', (req, res) => {
+    if (rejectUnexpectedOrigin(req, res, 'Verifier result')) return;
+    if (!hasExactFields(req.body, [])) {
+        return res.status(400).json({ error: 'Invalid verifier result request' });
+    }
+    const session = getSession(req.params.sessionId);
+    if (!session) {
+        return res.status(404).json({ error: 'Session not found or expired' });
+    }
+    if (!session.verified || session.cancelled) {
+        return res.status(409).json({ error: 'This verification session has no completed result' });
+    }
+    if (session.returnTokenIssued) {
+        const pending = VERIFIER_RETURN_NONCES.get(session.returnTokenNonce);
+        if (pending && pending.expiresAt > Date.now()) {
+            res.set('Cache-Control', 'no-store');
+            return res.json({
+                token: session.returnToken,
+                state: session.verifierState,
+            });
+        }
+        return res.status(409).json({ error: 'The verifier result has expired or already been used' });
+    }
+    for (const [nonce, record] of VERIFIER_RETURN_NONCES) {
+        if (record.expiresAt <= Date.now()) VERIFIER_RETURN_NONCES.delete(nonce);
+    }
+    if (VERIFIER_RETURN_NONCES.size >= MAX_VERIFIER_RETURN_NONCES) {
+        return res.status(503).json({ error: 'Verifier results are temporarily unavailable' });
+    }
+
+    const sessionHash = createHash('sha256')
+        .update(session.sessionId, 'utf8')
+        .digest('hex');
+    const { token, payload } = createVerifierReturnToken({
+        sessionHash,
+        isAdult: session.isAdult === true,
+        state: session.verifierState,
+        secret: SESSION_SECRET,
+    });
+    VERIFIER_RETURN_NONCES.set(payload.nonce, {
+        sessionHash,
+        state: payload.state,
+        expiresAt: payload.exp * 1000,
+    });
+    session.returnTokenIssued = true;
+    session.returnToken = token;
+    session.returnTokenNonce = payload.nonce;
+    res.set('Cache-Control', 'no-store');
+    return res.json({ token, state: payload.state });
+});
+
 app.get('/api/session/:sessionId/qr', async (req, res) => {
     const session = getSession(req.params.sessionId);
     if (!session) {
@@ -525,10 +869,7 @@ app.get('/api/session/:sessionId/qr', async (req, res) => {
 });
 
 app.post('/api/session/:sessionId/cancel', (req, res) => {
-    const requestOrigin = req.get('origin');
-    if (requestOrigin && requestOrigin !== ORIGIN) {
-        return res.status(403).json({ error: 'Cancellation must come from the configured app origin' });
-    }
+    if (rejectUnexpectedOrigin(req, res, 'Cancellation')) return;
 
     const session = getSession(req.params.sessionId);
     if (!session) {
@@ -1393,6 +1734,10 @@ app.post('/api/verify/wallet', async (req, res) => {
 });
 
 app.get('/auth/callback', async (req, res) => {
+    res.append(
+        'Set-Cookie',
+        clearOAuthStateCookie(configuredOrigin.protocol === 'https:')
+    );
     if (req.query.error) {
         return res.status(400).send('OAuth sign-in was not completed. Return to BlindPass and try again.');
     }
@@ -1400,7 +1745,12 @@ app.get('/auth/callback', async (req, res) => {
     const state = String(req.query.state || '');
     const authState = OAUTH_STATES.get(state);
     OAUTH_STATES.delete(state);
-    if (!authState || authState.expiresAt <= Date.now()) {
+    const cookieState = getCookieValue(req.get('cookie'), 'blindpass_oauth_state');
+    if (
+        !authState ||
+        authState.expiresAt <= Date.now() ||
+        !isSafeEqual(state, cookieState)
+    ) {
         return res.status(400).send('The sign-in request expired. Return to BlindPass and try again.');
     }
 
@@ -1421,12 +1771,20 @@ app.get('/auth/callback', async (req, res) => {
                 if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
                     return res.status(503).send('Google sign-in is not configured on this server.');
                 }
-                subject = await exchangeGoogleCode(code, redirectUri);
+                subject = await exchangeGoogleCode(
+                    code,
+                    redirectUri,
+                    authState.codeVerifier
+                );
             } else {
                 if (!MICROSOFT_CLIENT_ID || !MICROSOFT_CLIENT_SECRET) {
                     return res.status(503).send('Microsoft sign-in is not configured on this server.');
                 }
-                subject = await exchangeMicrosoftCode(code, redirectUri);
+                subject = await exchangeMicrosoftCode(
+                    code,
+                    redirectUri,
+                    authState.codeVerifier
+                );
             }
         } else if (req.query.demo === '1' && process.env.NODE_ENV !== 'production') {
             subject = `blindpass-local-demo:${authState.provider}`;
@@ -1438,7 +1796,12 @@ app.get('/auth/callback', async (req, res) => {
         if (!supabase) {
             return res.status(503).send('BlindPass account storage is not configured on this server.');
         }
-        const userId = await resolveOAuthUser(supabase, authState.provider, subject);
+        const userId = await resolveOAuthUser(
+            supabase,
+            authState.provider,
+            subject,
+            OAUTH_SUBJECT_PEPPER
+        );
         if (session?.userId && session.userId !== userId) {
             return res.status(409).send('This verification session is already connected to another account.');
         }
@@ -1475,9 +1838,20 @@ app.get('/auth/:provider', (req, res) => {
         return res.status(409).send('This verification session is no longer available.');
     }
 
+    for (const [oldState, record] of OAUTH_STATES) {
+        if (record.expiresAt <= Date.now()) OAUTH_STATES.delete(oldState);
+    }
+    if (OAUTH_STATES.size >= MAX_OAUTH_STATES) {
+        return res.status(503).send('Too many active sign-in requests. Try again shortly.');
+    }
     const state = randomBytes(32).toString('base64url');
+    const codeVerifier = randomBytes(32).toString('base64url');
+    const codeChallenge = createHash('sha256')
+        .update(codeVerifier, 'utf8')
+        .digest('base64url');
     OAUTH_STATES.set(state, {
         provider,
+        codeVerifier,
         sessionId: session?.sessionId || null,
         expiresAt: Math.min(
             Date.now() + OAUTH_STATE_LIFETIME_MS,
@@ -1493,6 +1867,12 @@ app.get('/auth/:provider', (req, res) => {
         url.searchParams.set('response_type', 'code');
         url.searchParams.set('scope', 'openid');
         url.searchParams.set('state', state);
+        url.searchParams.set('code_challenge', codeChallenge);
+        url.searchParams.set('code_challenge_method', 'S256');
+        res.append(
+            'Set-Cookie',
+            serializeOAuthStateCookie(state, configuredOrigin.protocol === 'https:')
+        );
         return res.redirect(302, url.toString());
     }
 
@@ -1504,6 +1884,12 @@ app.get('/auth/:provider', (req, res) => {
         url.searchParams.set('scope', 'openid profile User.Read');
         url.searchParams.set('response_mode', 'query');
         url.searchParams.set('state', state);
+        url.searchParams.set('code_challenge', codeChallenge);
+        url.searchParams.set('code_challenge_method', 'S256');
+        res.append(
+            'Set-Cookie',
+            serializeOAuthStateCookie(state, configuredOrigin.protocol === 'https:')
+        );
         return res.redirect(302, url.toString());
     }
 
@@ -1511,6 +1897,10 @@ app.get('/auth/:provider', (req, res) => {
         OAUTH_STATES.delete(state);
         return res.status(503).send(`${provider} sign-in is not configured on this server.`);
     }
+    res.append(
+        'Set-Cookie',
+        serializeOAuthStateCookie(state, configuredOrigin.protocol === 'https:')
+    );
     return res.redirect(302, `/auth/callback?state=${encodeURIComponent(state)}&demo=1`);
 });
 

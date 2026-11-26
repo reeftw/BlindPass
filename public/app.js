@@ -58,7 +58,7 @@ function loadExternalScript(src, isReady) {
 
 async function getTesseract() {
     await loadExternalScript(
-        'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js',
+        '/vendor/tesseract/tesseract.min.js',
         () => Boolean(window.Tesseract)
     );
     if (!window.Tesseract) throw new Error('The local OCR library did not initialize.');
@@ -195,13 +195,23 @@ async function signInWithPasskey() {
 }
 
 async function saveWalletBadge(outcome, qrToken = null) {
+    const requestBody = qrToken ? { qrToken } : {};
+    const { flowToken, options } = await passkeyRequest(
+        '/api/wallet/save/options',
+        requestBody
+    );
+    const assertion = await (await getPasskeyBrowser()).startAuthentication({
+        optionsJSON: options,
+    });
     return passkeyRequest('/api/wallet/save', {
-        ...(qrToken ? { qrToken } : {}),
+        ...requestBody,
         verified: true,
         isAdult: outcome.isAdult,
         documentType: outcome.documentType,
         issuingCountry: outcome.issuingCountry,
         expiresAt: outcome.expiresAt,
+        flowToken,
+        assertion,
     });
 }
 
@@ -580,7 +590,30 @@ async function initBlindPassSession() {
             else if (sessionBanner) sessionBanner.innerText = message;
             return;
         }
-        const session = await res.json();
+        let session = await res.json();
+        if (!isPhoneFlow && !session.loggedIn) {
+            const claimResponse = await fetch(
+                `/api/session/${encodeURIComponent(sessionId)}/claim`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    cache: 'no-store',
+                    body: '{}',
+                }
+            );
+            if (claimResponse.ok) {
+                const refreshedSession = await fetch(
+                    `/api/session/${encodeURIComponent(sessionId)}`,
+                    { cache: 'no-store' }
+                );
+                if (!refreshedSession.ok) {
+                    throw new Error(`Could not load claimed session (${refreshedSession.status}).`);
+                }
+                session = await refreshedSession.json();
+            } else if (claimResponse.status !== 401) {
+                throw new Error(`Could not claim verification session (${claimResponse.status}).`);
+            }
+        }
         currentSession = session;
         verifierName = session.verifierName || session.verifier || 'Verifier';
 
@@ -687,20 +720,29 @@ function redirectFromCancelledSession(session = currentSession) {
     }
 }
 
-function showDesktopCompletion(session) {
+async function showDesktopCompletion(session) {
     if (desktopCompletionShown) return;
     desktopCompletionShown = true;
     desktopPollingStopped = true;
     if (desktopPollTimeout) window.clearTimeout(desktopPollTimeout);
 
-    const target = getRequesterReturnUrl(session);
     const desktopResult = document.getElementById('desktopResult');
     const desktopReturnBtn = document.getElementById('desktopReturnBtn');
     currentSession = session;
+    let target = null;
+    let returnTokenError = false;
+    try {
+        target = await getRequesterReturnUrl(session);
+    } catch (error) {
+        console.error('Could not prepare verifier return token:', error);
+        returnTokenError = true;
+    }
     if (desktopResult) {
-        desktopResult.innerText = session.isOver18
-            ? 'ID Verified (18+).'
-            : 'ID Verified — Under 18.';
+        desktopResult.innerText = returnTokenError
+            ? 'ID verified, but a secure verifier result could not be prepared.'
+            : session.isOver18
+                ? 'ID Verified (18+).'
+                : 'ID Verified — Under 18.';
     }
     if (desktopReturnBtn) {
         desktopReturnBtn.href = target?.toString() || '#';
@@ -724,11 +766,25 @@ function showDesktopCompletion(session) {
     showProfilePopover(false);
 }
 
-function getRequesterReturnUrl(session) {
+async function getRequesterReturnUrl(session) {
+    if (!session.returnTo || !sessionId) return null;
+    const response = await fetch(
+        `/api/session/${encodeURIComponent(sessionId)}/return-token`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            cache: 'no-store',
+            body: '{}',
+        }
+    );
+    const result = await response.json();
+    if (!response.ok) {
+        throw new Error(result.error || 'Could not prepare a secure verifier result.');
+    }
     return buildVerificationReturnUrl(
         session.returnTo,
         session.appOrigin || window.location.origin,
-        { verified: true, isAdult: session.isOver18 === true }
+        { verifierToken: result.token, state: result.state }
     );
 }
 
@@ -1130,6 +1186,8 @@ async function recognizeMrzDocument(blob, statusDiv, documentType, countryCode, 
     const tesseract = await getTesseract();
     let progressLabel = 'Reading the MRZ';
     const worker = await tesseract.createWorker('eng', 1, {
+        workerPath: '/vendor/tesseract/worker.min.js',
+        corePath: '/vendor/tesseract-core',
         logger: ({ status, progress }) => {
             if (status === 'recognizing text' && typeof progress === 'number') {
                 statusDiv.innerText = `${progressLabel}... ${Math.round(progress * 100)}%`;

@@ -31,26 +31,32 @@ test('Wallet request shows phone scanning only when no verified ID is saved', ()
     assert.equal(getWalletRequestMode({ verified: true, isEligibleForAgeGate: false }), 'wallet');
 });
 
-test('builds dynamic verifier return links with verification status parameters', () => {
+test('returns signed verifier tokens instead of untrusted status flags', () => {
     assert.equal(getReturnActionLabel('Discord'), 'Return to Discord');
     assert.equal(getReturnActionLabel(''), 'Return to Verifier');
 
     const returnUrl = buildVerificationReturnUrl(
         'https://discord.com/verify?source=blindpass',
         'https://blindpass.example',
-        { verified: true, isAdult: true }
+        { verifierToken: 'signed-token', state: 'verifier-state-123456' }
     );
     assert.equal(returnUrl.origin, 'https://discord.com');
     assert.equal(returnUrl.searchParams.get('source'), 'blindpass');
-    assert.equal(returnUrl.searchParams.get('verified'), 'true');
-    assert.equal(returnUrl.searchParams.get('is_adult'), 'true');
+    assert.equal(returnUrl.searchParams.get('verifier_token'), 'signed-token');
+    assert.equal(returnUrl.searchParams.get('state'), 'verifier-state-123456');
+    assert.equal(returnUrl.searchParams.has('verified'), false);
+    assert.equal(returnUrl.searchParams.has('is_adult'), false);
+    assert.equal(buildVerificationReturnUrl(
+        'https://discord.com/verify',
+        'https://blindpass.example',
+        { state: 'verifier-state-123456' }
+    ), null);
 
     const cancelledUrl = buildVerificationReturnUrl(
         'https://reddit.com/check',
         'https://blindpass.example',
         { verified: false, cancelled: true }
     );
-    assert.equal(cancelledUrl.searchParams.get('verified'), 'false');
     assert.equal(cancelledUrl.searchParams.get('cancelled'), 'true');
     assert.equal(buildVerificationReturnUrl(null, 'https://blindpass.example', {
         verified: false,

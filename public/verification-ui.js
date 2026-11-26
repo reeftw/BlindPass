@@ -16,16 +16,22 @@ export function getReturnActionLabel(verifierName) {
 export function buildVerificationReturnUrl(
     returnTo,
     appOrigin,
-    { verified, isAdult = false, cancelled = false }
+    { verifierToken, state, cancelled = false }
 ) {
     if (!returnTo) return null;
     const target = new URL(returnTo, appOrigin);
-    target.searchParams.set('verified', String(verified));
+    target.searchParams.delete('verified');
+    target.searchParams.delete('is_adult');
+    target.searchParams.delete('is_over_18');
+    target.searchParams.delete('verifier_token');
+    target.searchParams.delete('state');
+    target.searchParams.delete('cancelled');
     if (cancelled) {
         target.searchParams.set('cancelled', 'true');
     } else {
-        target.searchParams.set('is_adult', String(isAdult === true));
-        target.searchParams.set('is_over_18', String(isAdult === true));
+        if (typeof verifierToken !== 'string' || typeof state !== 'string') return null;
+        target.searchParams.set('verifier_token', verifierToken);
+        target.searchParams.set('state', state);
     }
     return target;
 }

@@ -7,6 +7,10 @@ import {
     resolveVerifierLaunch,
     safeReturnUrl,
 } from '../server/verification.js';
+import {
+    createVerifierReturnToken,
+    verifyVerifierReturnToken,
+} from '../server/verifier-token.js';
 
 test('resolves verifier names and return URLs from current and legacy launch parameters', () => {
     const appOrigin = 'https://blindpass.example';
@@ -125,4 +129,49 @@ test('does not cancel expired, claimed, or completed sessions', () => {
     };
     assert.equal(cancelVerificationSession(completedSession, 1000), 'used');
     assert.equal(completedSession.cancelled, false);
+});
+
+test('signs short-lived verifier results, binds state, and consumes each nonce once', () => {
+    const secret = 'verifier-test-secret-that-is-long-enough';
+    const state = 'verifier-state-1234567890';
+    const now = 1_000_000;
+    const { token, payload } = createVerifierReturnToken({
+        sessionHash: 'a'.repeat(64),
+        isAdult: true,
+        state,
+        secret,
+        now,
+    });
+    const nonces = new Map([[payload.nonce, {
+        sessionHash: payload.session_hash,
+        state,
+        expiresAt: payload.exp * 1000,
+    }]]);
+    const verify = (testToken = token, expectedState = state, at = now) => (
+        verifyVerifierReturnToken(testToken, {
+            secret,
+            expectedState,
+            pendingNonces: nonces,
+            now: at,
+        })
+    );
+
+    assert.equal(verify().is_adult, true);
+    assert.equal(verify(), null);
+
+    const second = createVerifierReturnToken({
+        sessionHash: 'b'.repeat(64),
+        isAdult: false,
+        state,
+        secret,
+        now,
+    });
+    nonces.set(second.payload.nonce, {
+        sessionHash: second.payload.session_hash,
+        state,
+        expiresAt: second.payload.exp * 1000,
+    });
+    assert.equal(verify(second.token, 'different-state-123456'), null);
+    assert.equal(verify(`${second.token}x`), null);
+    assert.equal(verify(second.token, state, now + 181_000), null);
 });

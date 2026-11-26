@@ -436,6 +436,24 @@ function collectCandidates(lines, format) {
     return candidates;
 }
 
+function resolveTd1DocumentNumber(documentNumber, checkDigit, optionalData) {
+    if (/^\d$/.test(checkDigit)) {
+        return normalizeAlphanumericForCheckDigit(documentNumber, checkDigit);
+    }
+    if (checkDigit !== '<') return null;
+
+    for (let overflowLength = 1; overflowLength < optionalData.length; overflowLength++) {
+        const overflowCheckDigit = optionalData[overflowLength];
+        if (!/^\d$/.test(overflowCheckDigit)) continue;
+        const extendedDocumentNumber = normalizeAlphanumericForCheckDigit(
+            documentNumber + optionalData.slice(0, overflowLength),
+            overflowCheckDigit
+        );
+        if (extendedDocumentNumber) return extendedDocumentNumber;
+    }
+    return null;
+}
+
 function validateCandidate(lines, format, selectedCountry, today) {
     const normalizedLines = normalizeCandidateFields(lines, format);
     const line1 = normalizedLines[0];
@@ -443,7 +461,7 @@ function validateCandidate(lines, format, selectedCountry, today) {
     if (format === 'TD3' && line1[0] !== 'P') {
         return { ok: false, error: 'invalid-document-type' };
     }
-    if (format === 'TD1' && line1[0] !== 'I') {
+    if (format === 'TD1' && !['I', 'A', 'C'].includes(line1[0])) {
         return { ok: false, error: 'invalid-document-type' };
     }
 
@@ -495,10 +513,16 @@ function validateCandidate(lines, format, selectedCountry, today) {
         compositeCheckDigit = line2[29];
     }
 
-    documentNumber = normalizeAlphanumericForCheckDigit(
-        documentNumber,
-        documentNumberCheckDigit
-    );
+    documentNumber = format === 'TD1'
+        ? resolveTd1DocumentNumber(
+            documentNumber,
+            documentNumberCheckDigit,
+            optionalData
+        )
+        : normalizeAlphanumericForCheckDigit(
+            documentNumber,
+            documentNumberCheckDigit
+        );
     if (!documentNumber) return { ok: false, error: 'invalid-check-digit' };
 
     if (format === 'TD3') {

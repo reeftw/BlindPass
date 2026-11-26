@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check server/auth.js && node --check server/accounts.js && node --check server/wallet.js && node --check server/verification.js && node --check server/passkeys.js && node --check server/webauthn-config.js && node --check public/app.js && node --check public/verification-ui.js && node --check public/mrz.js && node --check public/camera-crop.js && node --check public/icao-countries.js",
+    "check": "node --check server.js && node --check server/auth.js && node --check server/accounts.js && node --check server/wallet.js && node --check server/verification.js && node --check server/passkeys.js && node --check server/verifier-token.js && node --check server/webauthn-config.js && node --check public/app.js && node --check public/verifier.js && node --check public/verification-ui.js && node --check public/mrz.js && node --check public/camera-crop.js && node --check public/icao-countries.js && node --check scripts/benchmark-midv2020.js",
     "test": "node --test"
   },
   "dependencies": {

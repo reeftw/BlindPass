@@ -61,6 +61,7 @@ function makeTd2({
 }
 
 function makeTd1({
+    documentCode = 'I',
     issuer = 'D<<',
     nationality = 'DEU',
     documentNumber = 'A12345678',
@@ -70,7 +71,15 @@ function makeTd1({
     secondOptionalData = '<'.repeat(11),
     name = 'DOE<<JANE',
 } = {}) {
-    const line1 = `I<${issuer}${documentNumber}${check(documentNumber)}${optionalData}`;
+    const numberField = documentNumber.slice(0, 9);
+    const overflow = documentNumber.slice(9);
+    const optionalField = overflow
+        ? `${overflow}${check(documentNumber)}${optionalData}`
+            .slice(0, 15)
+            .padEnd(15, '<')
+        : optionalData;
+    const line1 = `${documentCode}<${issuer}${numberField}`
+        + `${overflow ? '<' : check(documentNumber)}${optionalField}`;
     let line2 = dateOfBirth
         + check(dateOfBirth)
         + 'F'
@@ -525,6 +534,22 @@ test('validates TD1 ID cards', () => {
 
     assert.equal(result.ok, true);
     assert.equal(result.format, 'TD1');
+});
+
+test('accepts TD1 document codes I, A, and C and extended document numbers', () => {
+    for (const documentCode of ['I', 'A', 'C']) {
+        const standard = makeTd1({ documentCode });
+        assert.equal(
+            parseMrzText(standard.join('\n'), 'id-card', 'DEU', today).ok,
+            true,
+            `${documentCode} document code should parse`
+        );
+    }
+
+    const extendedNumber = 'A123456789012345';
+    const extended = makeTd1({ documentNumber: extendedNumber });
+    assert.equal(extended[0][14], '<');
+    assert.equal(parseMrzText(extended.join('\n'), 'id-card', 'DEU', today).ok, true);
 });
 
 test('rejects invalid TD2 and TD1 check digits', () => {

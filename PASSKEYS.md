@@ -23,9 +23,11 @@ do not add them to browser code or commit them to source control.
 
 Register `${APP_ORIGIN}/auth/callback` as the redirect URI with each OAuth
 provider. The Google sign-in requests the OIDC subject; Microsoft obtains the
-account subject from Microsoft Graph. Only a SHA-256 hash of provider plus
-subject is stored. Email addresses and raw OAuth subject identifiers are not
-stored.
+account subject from Microsoft Graph. Only a keyed HMAC-SHA-256 of provider
+plus subject is stored. The dedicated `OAUTH_SUBJECT_PEPPER` is used when
+configured; otherwise `SESSION_SECRET` is the key. Email addresses and raw
+OAuth subject identifiers are not stored. Existing accounts are upgraded from
+the earlier unkeyed hash on their next successful sign-in.
 
 | Environment | `APP_ORIGIN` | `RP_ID` |
 | --- | --- | --- |

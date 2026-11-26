@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
     hashOAuthSubject,
     resolveOAuthUser,
@@ -15,13 +16,22 @@ import { claimVerificationToken, createVerificationRecord } from '../server/veri
 
 const userId = 'c0a80123-4567-489a-bcde-1234567890ab';
 const countryCodes = new Set(['DEU', 'GBR', 'USA']);
+const subjectPepper = 'stable-test-only-oauth-subject-pepper';
 
 test('hashes OAuth provider subjects and stores no raw subject identifier', async () => {
     const rawSubject = 'provider-account-subject';
-    const expectedHash = hashOAuthSubject('google', rawSubject);
+    const expectedHash = hashOAuthSubject('google', rawSubject, subjectPepper);
     assert.match(expectedHash, /^[0-9a-f]{64}$/);
     assert.notEqual(expectedHash, rawSubject);
-    assert.notEqual(expectedHash, hashOAuthSubject('microsoft', rawSubject));
+    assert.notEqual(expectedHash, hashOAuthSubject('microsoft', rawSubject, subjectPepper));
+    assert.notEqual(
+        expectedHash,
+        hashOAuthSubject('google', rawSubject, 'another-test-only-subject-pepper')
+    );
+    const legacyHash = createHash('sha256')
+        .update(`google:${rawSubject}`, 'utf8')
+        .digest('hex');
+    const lookupHashes = [];
 
     let storedUser;
     const supabase = {
@@ -31,7 +41,7 @@ test('hashes OAuth provider subjects and stores no raw subject identifier', asyn
                 select() { return this; },
                 eq(column, value) {
                     assert.equal(column, 'oauth_subject_hash');
-                    assert.equal(value, expectedHash);
+                    lookupHashes.push(value);
                     return this;
                 },
                 async maybeSingle() {
@@ -48,12 +58,57 @@ test('hashes OAuth provider subjects and stores no raw subject identifier', asyn
         },
     };
 
-    assert.equal(await resolveOAuthUser(supabase, 'google', rawSubject), userId);
+    assert.equal(await resolveOAuthUser(supabase, 'google', rawSubject, subjectPepper), userId);
+    assert.deepEqual(lookupHashes, [expectedHash, legacyHash]);
     assert.deepEqual(storedUser, {
         oauth_provider: 'google',
         oauth_subject_hash: expectedHash,
     });
     assert.equal(JSON.stringify(storedUser).includes(rawSubject), false);
+});
+
+test('upgrades a legacy OAuth subject hash in place on sign-in', async () => {
+    const rawSubject = 'existing-provider-subject';
+    const legacyHash = createHash('sha256')
+        .update(`google:${rawSubject}`, 'utf8')
+        .digest('hex');
+    const expectedHash = hashOAuthSubject('google', rawSubject, subjectPepper);
+    let updateRecord = null;
+    let inserted = false;
+    let lookupHash = null;
+    const supabase = {
+        from(table) {
+            assert.equal(table, 'users');
+            return {
+                select() { return this; },
+                eq(column, value) {
+                    if (column === 'oauth_subject_hash') lookupHash = value;
+                    return this;
+                },
+                update(record) {
+                    updateRecord = record;
+                    return this;
+                },
+                insert() {
+                    inserted = true;
+                    return this;
+                },
+                async maybeSingle() {
+                    if (updateRecord) return { data: { id: userId }, error: null };
+                    return lookupHash === legacyHash
+                        ? { data: { id: userId }, error: null }
+                        : { data: null, error: null };
+                },
+            };
+        },
+    };
+
+    assert.equal(
+        await resolveOAuthUser(supabase, 'google', rawSubject, subjectPepper),
+        userId
+    );
+    assert.deepEqual(updateRecord, { oauth_subject_hash: expectedHash });
+    assert.equal(inserted, false);
 });
 
 test('validates Wallet badges without accepting personal document fields', () => {
